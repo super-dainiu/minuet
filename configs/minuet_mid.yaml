@@ -1,0 +1,148 @@
+data:
+  # Mirrors apollo_elegant_beta05_foundation.yaml (two-anchor FM recipe).
+  # Apollo-FM-0420 is the published training data corpus; CMI-BI adds
+  # a training-time conditional-MI batch-invariance loss on top.
+  paired_artifacts:
+  - artifact_dir: artifacts/wang_pilot
+    batch_labels_npz: artifacts/wang_pilot/batch_labels.npz
+    batch_key: sample_id
+    study_id: wang2025
+  - artifact_dir: artifacts/rosmap_paired
+    batch_labels_npz: artifacts/rosmap_paired/batch_labels.npz
+    batch_key: sample_id
+    study_id: rosmap2024
+  rna_artifacts:
+  - artifacts/projected/rna_human_brain_full_metadata_wang
+  - artifacts/projected/rna_snRNA12_wang
+  atac_artifacts:
+  - artifacts/projected/atac_mannens_wang
+  - artifacts/projected/atac_li_wang
+  - artifacts/projected/atac_rosmap_wang
+  val_paired_artifacts:
+  - artifact_dir: artifacts/wang_pilot
+    batch_labels_npz: artifacts/wang_pilot/batch_labels.npz
+    batch_key: sample_id
+    study_id: wang2025
+  - artifact_dir: artifacts/rosmap_paired
+    batch_labels_npz: artifacts/rosmap_paired/batch_labels.npz
+    batch_key: sample_id
+    study_id: rosmap2024
+
+# apollo-fm-0420 + CMI-BI — proposed foundation-model recipe with
+# intrinsic (training-time) batch correction. CMI-BI minimizes
+# I(z; b | y) via a CLUB-style upper bound (Cheng et al. 2020)
+# stratified by cell-type y, plus a sup-con loss (Khosla et al. 2020)
+# that lower-bounds I(z; y). The aux classifier q_psi(b | z, y) is
+# trained in an inner bilevel loop on detached z.
+#
+# Hypothesis: CMI-BI replaces the role that post-hoc Harmony plays
+# in the scIB-Total scoreboard with a training-time, Apollo-native
+# mechanism. Because it conditions on y, it does not collapse
+# cell-type separation the way marginal DANN does (ramped-DANN
+# negative result: Region F1 0.767 at iLISI +0.013).
+#
+# Evaluation target (beat-all-baselines table in the takeaways note):
+#   - Region F1 (MLP) stays ≥ 0.86
+#   - Retrieval MRR stays ≥ 0.06
+#   - Cross-study Region F1 on ROSMAP stays ≥ 0.50
+#   - iLISI (Wang) rises to ≥ 0.10 (currently 0.025)
+#   - kBET (Wang) rises to ≥ 0.40 (currently 0.214)
+# If iLISI / kBET rise with Region F1 held, Apollo becomes the
+# single model that beats Seurat / MultiVI on every metric.
+model:
+  type: v3
+  group_size: 64
+  token_dim: 256
+  n_cell_tokens: 4
+  n_context_tokens: 0
+  n_private_tokens: 2
+  n_memory_tokens: 0
+  num_heads: 8
+  num_encoder_blocks: 8
+  num_joint_blocks: 3
+  ff_multiplier: 4
+  token_dropout: 0.0
+  cell_dim: 128
+  context_dim: 0
+  private_dim: 16
+  decoder_hidden_dims: [512, 1024]
+  dropout: 0.1
+  min_logvar: -8.0
+  max_logvar: 8.0
+  batch_embed_dim: 8
+  pooler_mode: false
+  use_encoder_batch_cov: false
+  # CMI-BI aux network config (parallels `adversarial_batch: true` for DANN).
+  # The training loop reads these to instantiate ConditionalCLUBAux.
+  cmi_bi: true
+  cmi_bi_hidden: 128
+  cmi_bi_n_classes: null    # filled in by loader from type_updated vocab
+
+transforms:
+  rna_target_sum: 1.0e4
+  atac_target_sum: 1.0e4
+
+training:
+  seed: 42
+  batch_size: 768
+  lr: 5.0e-4
+  weight_decay: 1.0e-4
+  recon_weight: 1.0
+  contrastive_weight: 0.5
+  kl_shared_weight: 5.0e-5
+  kl_private_weight: 5.0e-5
+  alignment_weight: 0.0
+  shared_recon_weight: 2.0
+  self_shared_recon_weight: 0.0
+  fusion_weight: 0.0
+  decouple_weight: 0.0
+  temperature: 0.05
+  contrastive_beta: 0.5
+  mae_mask_ratio: 0.1
+  mask_nonzeros_p: 0.0
+  dataset_aware_sampling: true
+  grad_clip_norm: 1.0
+  # --- CMI-BI additions ---
+  # η — total CMI-BI weight (applied to club_weight * L_club + supcon_weight * L_supcon).
+  cmi_bi_weight: 0.15
+  cmi_bi_club_weight: 1.0
+  cmi_bi_supcon_weight: 0.1
+  cmi_bi_supcon_temperature: 0.07
+  # Inner-loop aux optimizer: Higher LR than main model since q_psi is
+  # a small MLP that needs to track the shared latent closely.
+  cmi_bi_aux_lr: 1.0e-3
+  cmi_bi_aux_weight_decay: 1.0e-4
+  cmi_bi_aux_steps_per_main: 1
+  cmi_bi_warmup_epochs: 5      # hold cmi_bi_weight at 0 during paired warmup
+  # ------------------------
+  source_weights:
+    paired: 6
+    rna: 2
+    atac: 2
+  warmup_epochs_paired_only: 5
+  steps_per_epoch: 3000
+  selection_metric: paired_retrieval
+  retrieval_eval_cells: 4096
+  log_retrieval_each_epoch: true
+  early_stopping_patience: 15
+  early_stopping_min_delta: 0.001
+  epochs: 50
+  note: >
+    apollo-fm-0420 + CMI-BI — training-time intrinsic batch correction
+    via a CLUB-style upper bound on I(z; b | y) plus supervised
+    contrastive on I(z; y). Implementation in apollo/cmi_bi.py;
+    bilevel loop handled by the train script when model.cmi_bi=true.
+    Requires a class label y per cell (uses type_updated from the
+    batch_labels.npz vocab; single-anchor classes mapped to a shared
+    taxonomy for the two-anchor run).
+
+wandb:
+  enabled: true
+  project: brain-foundation-model
+  name: minuet
+  tags:
+    - apollo
+    - foundation-model
+    - cmi-bi
+    - intrinsic-batch-correction
+    - wang-rosmap

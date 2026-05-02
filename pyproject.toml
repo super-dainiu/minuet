@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "minuet"
+version = "0.1.0"
+description = "Two-loss decomposition for paired snRNA+snATAC multiome integration"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "Apache-2.0"}
+authors = [
+    {name = "Yanjun Shao"},
+]
+classifiers = [
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+]
+
+dependencies = [
+    "torch>=2.0",
+    "numpy",
+    "pandas",
+    "scipy",
+    "scikit-learn",
+    "anndata",
+    "pyyaml",
+]
+
+[project.optional-dependencies]
+eval = [
+    "scib-metrics",
+    "umap-learn",
+    "matplotlib",
+    "seaborn",
+]
+
+[tool.setuptools.packages.find]
+include = ["minuet*"]
