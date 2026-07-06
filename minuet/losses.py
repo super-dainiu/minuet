@@ -11,14 +11,30 @@ class MinuetLosses:
         return F.mse_loss(x_hat, x)
 
     @staticmethod
-    def contrastive(x_shared: Tensor, y_shared: Tensor, temperature: float = 0.07) -> Tensor:
-        x_norm = F.normalize(x_shared, dim=-1)
-        y_norm = F.normalize(y_shared, dim=-1)
-        logits = (x_norm @ y_norm.T) / temperature
-        labels = torch.arange(x_shared.shape[0], device=x_shared.device)
-        loss_xy = F.cross_entropy(logits, labels)
-        loss_yx = F.cross_entropy(logits.T, labels)
-        return 0.5 * (loss_xy + loss_yx)
+    def contrastive(x_shared: Tensor, y_shared: Tensor, temperature: float = 0.07,
+                    fn_sim: float = 0.0) -> Tensor:
+        """Symmetric cross-modal InfoNCE with label-free false-negative cancellation.
+
+        A plain contrastive treats every other cell in the batch as a negative,
+        including cells of the same biological state as the anchor. Those false
+        negatives dominate the gradient when cell types are few and collapse
+        cross-modal retrieval. When ``fn_sim`` > 0 we drop, from each anchor's
+        negatives, the cells that are similar to it in BOTH modalities' shared codes
+        (cosine > ``fn_sim``): likely same-state pairs. This uses only the embeddings,
+        so it needs no cell-type labels, and the absolute-similarity gate self-adapts
+        -- diverse cohorts trip it rarely, low-diversity cohorts often.
+        """
+        x = F.normalize(x_shared, dim=-1)
+        y = F.normalize(y_shared, dim=-1)
+        logits = (x @ y.T) / temperature
+        n = x.shape[0]
+        labels = torch.arange(n, device=x.device)
+        if fn_sim > 0.0:
+            with torch.no_grad():
+                eye = torch.eye(n, dtype=torch.bool, device=x.device)
+                false_neg = (x @ x.T > fn_sim) & (y @ y.T > fn_sim) & ~eye
+            logits = logits.masked_fill(false_neg, -1e9)
+        return 0.5 * (F.cross_entropy(logits, labels) + F.cross_entropy(logits.T, labels))
 
     @staticmethod
     def alignment(x_shared: Tensor, y_shared: Tensor) -> Tensor:
@@ -40,6 +56,12 @@ class MinuetLosses:
 
     @staticmethod
     def cross_covariance(x: Tensor, y: Tensor) -> Tensor:
+        # Guard the empty-latent case (e.g. context_dim=0 / no context tokens):
+        # the cross-covariance of a zero-width latent is vacuously 0, but the
+        # naive code would compute mean() of an empty tensor (NaN) which then
+        # poisons the weighted sum even at weight 0 (0 * NaN = NaN).
+        if x.numel() == 0 or y.numel() == 0 or x.shape[-1] == 0 or y.shape[-1] == 0:
+            return x.new_zeros(())
         x_centered = x - x.mean(dim=0, keepdim=True)
         y_centered = y - y.mean(dim=0, keepdim=True)
         x_scaled = x_centered / (x_centered.std(dim=0, keepdim=True, unbiased=False) + 1.0e-4)
@@ -63,7 +85,9 @@ class MinuetLosses:
         fusion_weight: float = 1.0e-3,
         decouple_weight: float = 1.0e-3,
         adv_weight: float = 0.0,
+        nuisance_pred_weight: float = 0.0,
         temperature: float = 0.07,
+        fn_sim: float = 0.0,
     ) -> dict[str, Tensor]:
         losses: dict[str, Tensor] = {}
 
@@ -73,7 +97,10 @@ class MinuetLosses:
             losses["rna_cell_kl"] = cls.gaussian_kl(out["rna_cell_mu"], out["rna_cell_logvar"])
             losses["rna_context_kl"] = cls.gaussian_kl(out["rna_context_mu"], out["rna_context_logvar"])
             losses["rna_cell_context_decouple"] = cls.cross_covariance(out["rna_cell_mu"], out["rna_context_mu"])
-            losses["rna_shared_private_decouple"] = cls.cross_covariance(out["rna_shared"], out["rna_private_mu"])
+            # IndiSeek-style cross-modal disentanglement: the RNA-private factor should
+            # be independent of the OTHER modality's shared factor (C_atac), not its own
+            # shared factor -- the within-modality version is lossy when shared is redundant.
+            losses["rna_shared_private_decouple"] = cls.cross_covariance(out["atac_shared"], out["rna_private_mu"])
             if "rna_shared_self_recon" in out:
                 losses["rna_shared_self_recon"] = cls.reconstruction(rna_x, out["rna_shared_self_recon"])
 
@@ -83,13 +110,14 @@ class MinuetLosses:
             losses["atac_cell_kl"] = cls.gaussian_kl(out["atac_cell_mu"], out["atac_cell_logvar"])
             losses["atac_context_kl"] = cls.gaussian_kl(out["atac_context_mu"], out["atac_context_logvar"])
             losses["atac_cell_context_decouple"] = cls.cross_covariance(out["atac_cell_mu"], out["atac_context_mu"])
-            losses["atac_shared_private_decouple"] = cls.cross_covariance(out["atac_shared"], out["atac_private_mu"])
+            # IndiSeek cross-modal: ATAC-private independent of the RNA shared factor.
+            losses["atac_shared_private_decouple"] = cls.cross_covariance(out["rna_shared"], out["atac_private_mu"])
             if "atac_shared_self_recon" in out:
                 losses["atac_shared_self_recon"] = cls.reconstruction(atac_x, out["atac_shared_self_recon"])
 
         if rna_x is not None and atac_x is not None:
             losses["alignment"] = cls.alignment(out["rna_shared"], out["atac_shared"])
-            losses["contrastive"] = cls.contrastive(out["rna_shared"], out["atac_shared"], temperature=temperature)
+            losses["contrastive"] = cls.contrastive(out["rna_shared"], out["atac_shared"], temperature=temperature, fn_sim=fn_sim)
             losses["joint_cell_kl"] = cls.gaussian_kl(out["joint_cell_mu"], out["joint_cell_logvar"])
             losses["joint_context_kl"] = cls.gaussian_kl(out["joint_context_mu"], out["joint_context_logvar"])
             losses["cell_fusion_consistency"] = 0.5 * (
@@ -132,6 +160,13 @@ class MinuetLosses:
         if adv_weight > 0 and "batch_adv_logits" in out and "batch_adv_target" in out:
             losses["batch_adv"] = F.cross_entropy(out["batch_adv_logits"], out["batch_adv_target"])
 
+        # Structured-latent nuisance head loss (cross-entropy on context_mu,
+        # NO gradient reversal). Pushes context to be batch-predictive so it
+        # absorbs nuisance; combined with cell_context_decouple this routes
+        # batch information out of cell (= z_bio). Option A in the paper.
+        if nuisance_pred_weight > 0 and "nuisance_pred_logits" in out and "nuisance_pred_target" in out:
+            losses["nuisance_pred"] = F.cross_entropy(out["nuisance_pred_logits"], out["nuisance_pred_target"])
+
         total = torch.zeros((), device=next(iter(out.values())).device)
         for name, value in losses.items():
             if name in {"rna_recon", "atac_recon"}:
@@ -146,6 +181,8 @@ class MinuetLosses:
                 total = total + contrastive_weight * value
             elif name == "batch_adv":
                 total = total + adv_weight * value
+            elif name == "nuisance_pred":
+                total = total + nuisance_pred_weight * value
             elif "fusion_consistency" in name:
                 total = total + fusion_weight * value
             elif "decouple" in name:

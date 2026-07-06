@@ -24,6 +24,20 @@ Removing either loss leaves the other's contribution intact:
 - `−contrastive` ablation on the no-CMI-BI baseline shows the same pattern:
   retrieval at random floor.
 
+## Label-free false-negative cancellation
+
+A plain cross-modal contrastive treats every other cell in the batch as a
+negative, including cells of the same biological state as the anchor. These false
+negatives dominate the gradient when cell types are few, and RNA↔ATAC retrieval
+degrades on low-diversity cohorts. `MinuetLosses.contrastive(..., fn_sim=τ)` drops,
+from each anchor's negatives, the cells that are similar to it in **both**
+modalities' shared codes (cosine > τ): likely same-state pairs. It uses only the
+embeddings — no cell-type labels or counts — and the absolute-similarity gate
+self-adapts: diverse cohorts trip it rarely, low-diversity cohorts often. Default
+`fn_sim = 0.6`. This is the same context principle as CMI-BI's conditional donor
+term: biology governs both which cells to contrast and which donor signal to
+remove.
+
 ## Pareto pair (canonical recipes)
 
 Both ship in `configs/`:

@@ -57,9 +57,12 @@ def build_model_from_section(
         batch_embed_dim=int(model_section.get("batch_embed_dim", 0)),
         deep_tokenizer=bool(model_section.get("deep_tokenizer", False)),
         pooler_mode=bool(model_section.get("pooler_mode", False)),
+        cell_pool_feature=bool(model_section.get("cell_pool_feature", False)),
         use_encoder_batch_cov=bool(model_section.get("use_encoder_batch_cov", False)),
         adversarial_batch=bool(model_section.get("adversarial_batch", False)),
         adversary_hidden=int(model_section.get("adversary_hidden", 64)),
+        structured_latent=bool(model_section.get("structured_latent", False)),
+        nuisance_pred_hidden=int(model_section.get("nuisance_pred_hidden", 64)),
     )
     return "v3", {"type": "v3", **cfg.__dict__}, Minuet(cfg).to(device)
 
@@ -129,5 +132,6 @@ def compute_total_losses(
         fusion_weight=loss_cfg.get("fusion_weight", 1.0e-3),
         decouple_weight=loss_cfg.get("decouple_weight", 1.0e-3),
         adv_weight=loss_cfg.get("adv_weight", 0.0),
+        nuisance_pred_weight=loss_cfg.get("nuisance_pred_weight", 0.0),
         temperature=loss_cfg.get("temperature", 0.07),
     )

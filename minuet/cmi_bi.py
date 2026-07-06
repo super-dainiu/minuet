@@ -167,6 +167,124 @@ def supervised_contrastive_loss(
     return -log_prob_pos[has_positive].mean()
 
 
+def conditional_contrastive_loss(
+    z: Tensor,
+    y: Tensor,
+    b: Tensor,
+    temperature: float = 0.1,
+) -> Tensor:
+    """Conditional contrastive loss (Tsai et al. 2022). Critic-free.
+
+    For each anchor i, positives are same-cell-type / DIFFERENT-donor cells:
+    P(i) = { j != i : y_j = y_i, b_j != b_i }. Pulling same-type cells together
+    ACROSS donors directly mixes donors within each context, with no aux critic.
+    """
+    z_norm = F.normalize(z, dim=-1)
+    sim = (z_norm @ z_norm.t()) / temperature
+    n = z.size(0)
+    self_mask = torch.eye(n, dtype=torch.bool, device=z.device)
+    log_denom = torch.logsumexp(sim.masked_fill(self_mask, float("-inf")), dim=-1)
+    log_p = sim - log_denom.unsqueeze(-1)
+    labelled = (y >= 0)
+    pair_labelled = labelled.unsqueeze(0) & labelled.unsqueeze(1)
+    same_y = (y.unsqueeze(0) == y.unsqueeze(1))
+    diff_b = (b.unsqueeze(0) != b.unsqueeze(1))
+    pos_mask = same_y & diff_b & ~self_mask & pair_labelled
+    num_pos = pos_mask.float().sum(dim=-1)
+    has_pos = num_pos > 0
+    if not has_pos.any():
+        return z.new_zeros(())
+    log_prob_pos = (log_p * pos_mask.float()).sum(dim=-1) / num_pos.clamp(min=1.0)
+    return -log_prob_pos[has_pos].mean()
+
+
+def conditional_hsic_loss(
+    z: Tensor,
+    y: Tensor,
+    b: Tensor,
+    sigma: float | None = None,
+    min_stratum: int = 4,
+) -> Tensor:
+    """Conditional HSIC: a critic-FREE estimator of the dependence I(z; b | y).
+
+    The CLUB upper bound on I(z;b|y) is only valid when the inner classifier
+    q_psi converges to p(b|z,y); under a weak critic the encoder drives the
+    *bound* to zero by fooling the critic, not by removing donor (the vacuous-
+    critic failure). HSIC (Gretton et al. 2005) measures dependence directly
+    through kernels -- no network to fool -- and HSIC(z,b)=0 iff z is
+    independent of b for a characteristic kernel, the same independence target
+    as I(z;b)=0.
+
+    Computed WITHIN each context stratum y (the conditional version): an RBF
+    kernel K on z (median-heuristic bandwidth, detached) and a delta kernel L
+    on donor (L_ij = 1 iff b_i = b_j), then the biased empirical HSIC
+    tr(K H L H)/m^2 with centering H = I - (1/m)11^T, averaged over strata
+    weighted by stratum size. Differentiable w.r.t. z; minimising it makes
+    within-stratum z-similarity uninformative of donor.
+    """
+    labelled = y >= 0
+    if not labelled.any():
+        return z.new_zeros(())
+    z, y, b = z[labelled], y[labelled], b[labelled]
+    total = z.new_zeros(())
+    weight_sum = 0.0
+    for cls in torch.unique(y):
+        idx = torch.nonzero(y == cls, as_tuple=False).squeeze(-1)
+        m = idx.numel()
+        if m < min_stratum:
+            continue
+        zc, bc = z[idx], b[idx]
+        if torch.unique(bc).numel() < 2:
+            continue
+        d2 = torch.cdist(zc, zc) ** 2
+        if sigma is None:
+            off = d2[~torch.eye(m, dtype=torch.bool, device=z.device)]
+            sig2 = off.median().detach().clamp(min=1e-6)
+        else:
+            sig2 = z.new_tensor(float(sigma) ** 2)
+        K = torch.exp(-d2 / (2.0 * sig2))
+        L = (bc.unsqueeze(0) == bc.unsqueeze(1)).float()
+        H = torch.eye(m, device=z.device) - 1.0 / m
+        Kc = H @ K @ H
+        total = total + m * (Kc * L).sum() / (m * m)
+        weight_sum += m
+    if weight_sum == 0:
+        return z.new_zeros(())
+    return total / weight_sum
+
+
+def hard_negative_infonce(
+    rna_shared: Tensor,
+    atac_shared: Tensor,
+    b: Tensor,
+    y: Tensor,
+    temperature: float = 0.07,
+    beta: float = 2.0,
+) -> Tensor:
+    """Symmetric InfoNCE with same-donor + same-cell-type hard negatives.
+
+    Standard InfoNCE treats every off-diagonal cell as an equally-easy negative,
+    so a model can win by separating cells along donor or coarse cell-type axes
+    without learning true pair-level RNA<->ATAC correspondence. Here we upweight,
+    in the contrastive denominator, exactly the distractors that share both donor
+    b and cell-type context y with the anchor (and so cannot be told apart by the
+    donor or cell-type shortcut). Adding log(beta) to a negative's logit scales
+    its softmax mass by beta, pushing the model to place the true partner above
+    its same-donor same-context neighbours -- the quantity measured by
+    same-donor+same-C R@1. beta=1 recovers plain InfoNCE.
+    """
+    import math
+    xr = F.normalize(rna_shared, dim=-1)
+    xa = F.normalize(atac_shared, dim=-1)
+    logits = (xr @ xa.T) / temperature
+    n = xr.shape[0]
+    eye = torch.eye(n, dtype=torch.bool, device=xr.device)
+    hard = (b.view(-1, 1) == b.view(1, -1)) & (y.view(-1, 1) == y.view(1, -1)) & (~eye)
+    logits = logits + hard.to(logits.dtype) * math.log(max(beta, 1e-6))
+    labels = torch.arange(n, device=xr.device)
+    return 0.5 * (F.cross_entropy(logits, labels) + F.cross_entropy(logits.T, labels))
+
+
 def cmi_bi_total(
     aux: ConditionalCLUBAux,
     z: Tensor,

@@ -35,12 +35,22 @@ class MinuetConfig:
     # LeCun/statistician-style simplification: replace joint self-attention
     # with a single kernel-smoothing cross-attention pooler
     pooler_mode: bool = False
+    cell_pool_feature: bool = False  # DiT-style: pool shared code over feature tokens
     # Encoder-side batch conditioning for better batch correction (helps scIB batch metrics)
     use_encoder_batch_cov: bool = False
     # Adversarial batch classifier for batch-invariance (DANN-style, Ganin et al. 2015)
     # Trained with gradient reversal on the shared latent
     adversarial_batch: bool = False
     adversary_hidden: int = 64
+    # Structured-latent (Option A): re-task the context head as an explicit
+    # nuisance absorber. A non-reversed batch classifier on context_mu pushes
+    # context to be batch-predictive; the existing cell_context_decouple
+    # cross-covariance penalty keeps cell (= z_bio) orthogonal to context
+    # (= z_res). Downstream uses only cell as the shared embedding. Identifiability:
+    # under auxiliary-variability + Bayes-optimal nuisance head, z_bio is
+    # identified up to a y-equivariant invertible map (paper Theorem A.1).
+    structured_latent: bool = False
+    nuisance_pred_hidden: int = 64
 
 
 class _GradientReversal(torch.autograd.Function):
@@ -75,6 +85,26 @@ class BatchAdversary(nn.Module):
     def forward(self, shared_z: Tensor, alpha: float = 1.0) -> Tensor:
         reversed_z = gradient_reversal(shared_z, alpha)
         return self.classifier(reversed_z)
+
+
+class NuisanceBatchPredictor(nn.Module):
+    """Forward batch classifier with NO gradient reversal — same MLP shape
+    as `BatchAdversary` but trained to PREDICT batch from a latent slot.
+    Used in the structured-latent recipe (Option A) to make context_mu
+    explicitly absorb nuisance: the gradient flows back into the encoder
+    in the natural direction, pushing context toward batch-predictiveness.
+    Combined with the cell-context cross-covariance penalty, this routes
+    batch information into context and away from cell (= z_bio)."""
+    def __init__(self, latent_dim: int, hidden: int, n_batches: int) -> None:
+        super().__init__()
+        self.classifier = nn.Sequential(
+            nn.Linear(latent_dim, hidden),
+            nn.GELU(),
+            nn.Linear(hidden, n_batches),
+        )
+
+    def forward(self, z: Tensor) -> Tensor:
+        return self.classifier(z)
 
 
 class GaussianHead(nn.Module):
@@ -241,9 +271,11 @@ class FactorizedModalityEncoder(nn.Module):
         deep_tokenizer: bool = False,
         pooler_mode: bool = False,
         encoder_cov_dim: int = 0,
+        cell_pool_feature: bool = False,
     ) -> None:
         super().__init__()
         self.pooler_mode = bool(pooler_mode)
+        self.cell_pool_feature = bool(cell_pool_feature)
         self.encoder_cov_dim = int(encoder_cov_dim)
         # If encoder-side batch conditioning: append a projection of batch embedding
         # to the input before tokenization
@@ -337,6 +369,7 @@ class FactorizedModalityEncoder(nn.Module):
             token_parts.append(memory_tokens)
         n_latent = sum(part.shape[1] for part in token_parts)
 
+        feat_out = None
         if self.pooler_mode:
             # LeCun/statistician-style: latents are weighted sums of features (kernel smoothing).
             # No feature-feature self-attention in the joint stage.
@@ -349,7 +382,12 @@ class FactorizedModalityEncoder(nn.Module):
             for block in self.joint_blocks:
                 tokens = block(tokens)
             latent_tokens = self.output_norm(tokens[:, :n_latent])
-        cell_repr = latent_tokens[:, : self.n_cell_tokens].mean(dim=1)
+            feat_out = self.output_norm(tokens[:, n_latent:])
+        if self.cell_pool_feature and feat_out is not None:
+            # DiT-style mean-pool over self-attended feature tokens (no latent bottleneck)
+            cell_repr = feat_out.mean(dim=1)
+        else:
+            cell_repr = latent_tokens[:, : self.n_cell_tokens].mean(dim=1)
         context_start = self.n_cell_tokens
         context_end = context_start + self.n_context_tokens
         context_repr = latent_tokens[:, context_start:context_end].mean(dim=1)
@@ -436,6 +474,7 @@ class Minuet(nn.Module):
             max_logvar=config.max_logvar,
             deep_tokenizer=config.deep_tokenizer,
             pooler_mode=config.pooler_mode,
+            cell_pool_feature=config.cell_pool_feature,
             encoder_cov_dim=(self.batch_embed_dim if config.use_encoder_batch_cov else 0),
         )
         self.atac = FactorizedModalityEncoder(
@@ -459,6 +498,7 @@ class Minuet(nn.Module):
             max_logvar=config.max_logvar,
             deep_tokenizer=config.deep_tokenizer,
             pooler_mode=config.pooler_mode,
+            cell_pool_feature=config.cell_pool_feature,
             encoder_cov_dim=(self.batch_embed_dim if config.use_encoder_batch_cov else 0),
         )
         self.rna_decoder = FactorizedModalityDecoder(
@@ -480,11 +520,25 @@ class Minuet(nn.Module):
             dropout=config.dropout,
         )
 
+        # Structured-latent (Option A): nuisance head on context_mu. Active
+        # only if `structured_latent=True`, `n_batches > 1`, and `context_dim > 0`.
+        self.structured_latent = (
+            bool(getattr(config, "structured_latent", False))
+            and int(config.n_batches) > 1
+            and int(config.context_dim) > 0
+        )
+
         # Adversarial batch classifier (DANN): predicts batch from shared latent
         # with gradient reversal. Encourages the shared latent to be batch-invariant.
+        # Under structured-latent, "shared" is cell-only, so the adversary dim
+        # is cell_dim alone (else cell_dim + context_dim).
         self.adversarial_batch = bool(getattr(config, "adversarial_batch", False)) and int(config.n_batches) > 1
         if self.adversarial_batch:
-            shared_dim = int(config.cell_dim) + int(config.context_dim)
+            shared_dim = (
+                int(config.cell_dim)
+                if self.structured_latent
+                else int(config.cell_dim) + int(config.context_dim)
+            )
             self.batch_adversary = BatchAdversary(
                 latent_dim=shared_dim,
                 hidden=int(getattr(config, "adversary_hidden", 64)),
@@ -492,6 +546,14 @@ class Minuet(nn.Module):
             )
         else:
             self.batch_adversary = None
+        if self.structured_latent:
+            self.nuisance_head = NuisanceBatchPredictor(
+                latent_dim=int(config.context_dim),
+                hidden=int(getattr(config, "nuisance_pred_hidden", 64)),
+                n_batches=int(config.n_batches),
+            )
+        else:
+            self.nuisance_head = None
 
     def _batch_covariate(self, batch_idx: Tensor | None) -> Tensor | None:
         if self.batch_embedding is None or batch_idx is None:
@@ -530,8 +592,15 @@ class Minuet(nn.Module):
         out[f"{prefix}_cell_z"] = cell_z
         out[f"{prefix}_context_z"] = context_z
         out[f"{prefix}_private_z"] = private_z
-        out[f"{prefix}_shared"] = torch.cat([cell_mu, context_mu], dim=-1)
-        out[f"{prefix}_shared_z"] = torch.cat([cell_z, context_z], dim=-1)
+        # Under structured-latent (Option A), context is reserved for nuisance
+        # absorption — downstream embeddings use cell only. Under classical
+        # mode, shared = cat(cell, context) as before.
+        if self.structured_latent:
+            out[f"{prefix}_shared"] = cell_mu
+            out[f"{prefix}_shared_z"] = cell_z
+        else:
+            out[f"{prefix}_shared"] = torch.cat([cell_mu, context_mu], dim=-1)
+            out[f"{prefix}_shared_z"] = torch.cat([cell_z, context_z], dim=-1)
         decoder = self.rna_decoder if prefix == "rna" else self.atac_decoder
         out[f"{prefix}_shared_self_recon"] = decoder.reconstruct_from_shared(cell_z, context_z, batch_cov)
 
@@ -563,8 +632,15 @@ class Minuet(nn.Module):
             )
             joint_cell_z = _reparameterize(joint_cell_mu, joint_cell_logvar, training=self.training)
             joint_context_z = _reparameterize(joint_context_mu, joint_context_logvar, training=self.training)
-            joint_shared = torch.cat([joint_cell_mu, joint_context_mu], dim=-1)
-            joint_shared_z = torch.cat([joint_cell_z, joint_context_z], dim=-1)
+            if self.structured_latent:
+                # Downstream uses cell only; context_mu is held back for nuisance absorption.
+                joint_shared = joint_cell_mu
+                joint_shared_z = joint_cell_z
+                joint_shared_logvar = joint_cell_logvar
+            else:
+                joint_shared = torch.cat([joint_cell_mu, joint_context_mu], dim=-1)
+                joint_shared_z = torch.cat([joint_cell_z, joint_context_z], dim=-1)
+                joint_shared_logvar = torch.cat([joint_cell_logvar, joint_context_logvar], dim=-1)
             out["joint_cell"] = joint_cell_mu
             out["joint_cell_mu"] = joint_cell_mu
             out["joint_cell_logvar"] = joint_cell_logvar
@@ -575,7 +651,7 @@ class Minuet(nn.Module):
             out["joint_context_z"] = joint_context_z
             out["joint_shared"] = joint_shared
             out["joint_shared_mu"] = joint_shared
-            out["joint_shared_logvar"] = torch.cat([joint_cell_logvar, joint_context_logvar], dim=-1)
+            out["joint_shared_logvar"] = joint_shared_logvar
             out["joint_shared_z"] = joint_shared_z
             out["rna_recon"] = self.rna_decoder.reconstruct(joint_cell_z, joint_context_z, out["rna_private_z"], rna_cov)
             out["atac_recon"] = self.atac_decoder.reconstruct(joint_cell_z, joint_context_z, out["atac_private_z"], atac_cov)
@@ -606,5 +682,25 @@ class Minuet(nn.Module):
             if shared_for_adv is not None and batch_idx_for_adv is not None:
                 out["batch_adv_logits"] = self.batch_adversary(shared_for_adv, alpha=1.0)
                 out["batch_adv_target"] = batch_idx_for_adv.long()
+
+        # Structured-latent (Option A) nuisance head: predict batch from
+        # context_mu with NO gradient reversal — pushes context to be
+        # batch-predictive, absorbing nuisance away from cell (= z_bio).
+        if self.nuisance_head is not None:
+            if "joint_context" in out:
+                context_for_nuisance = out["joint_context"]
+                batch_idx_for_nuisance = rna_batch_idx if rna_batch_idx is not None else atac_batch_idx
+            elif rna_x is not None:
+                context_for_nuisance = out["rna_context_mu"]
+                batch_idx_for_nuisance = rna_batch_idx
+            elif atac_x is not None:
+                context_for_nuisance = out["atac_context_mu"]
+                batch_idx_for_nuisance = atac_batch_idx
+            else:
+                context_for_nuisance = None
+                batch_idx_for_nuisance = None
+            if context_for_nuisance is not None and batch_idx_for_nuisance is not None:
+                out["nuisance_pred_logits"] = self.nuisance_head(context_for_nuisance)
+                out["nuisance_pred_target"] = batch_idx_for_nuisance.long()
 
         return out
