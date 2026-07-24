@@ -1,81 +1,79 @@
 # Minuet
 
-A two-loss decomposition for paired snRNA + snATAC multiome integration.
+Minuet integrates fully paired single-cell RNA and ATAC measurements. Its public
+API follows the standard scvi-tools workflow, without requiring scvi-tools:
 
 ```python
-from minuet import Minuet, MinuetConfig, MinuetLosses
+import mudata
+from minuet import Minuet
+
+mdata = mudata.read_h5mu("paired_multiome.h5mu")
+
+Minuet.setup_mudata(
+    mdata,
+    modalities={"rna_layer": "rna", "atac_layer": "atac"},
+    batch_key="donor",
+    donor_key="donor",
+    context_key="tissue",
+)
+model = Minuet(mdata, n_latent=32)
+model.train(max_epochs=100, batch_size=128)
+
+mdata.obsm["X_minuet"] = model.get_latent_representation()
+rna_denoised = model.get_normalized_expression()
+atac_denoised = model.get_normalized_accessibility()
+model.save("minuet_model", overwrite=True)
 ```
 
-## Why two losses
+Reloading uses the same convention as scvi-tools:
 
-Minuet's design is the result of an ablation that found **contrastive and CMI-BI
-target distinct axes of the multiome integration problem**:
+```python
+model = Minuet.load("minuet_model", adata=mdata)
+```
 
-|                         | NT-Xent contrastive | CMI-BI |
-|-------------------------|---------------------|--------|
-| RNA↔ATAC retrieval      | **necessary + sufficient** | irrelevant |
-| within-modality scIB    | irrelevant          | **necessary + sufficient** |
-| supervised Region F1    | sets a ceiling      | rescues partial structure under compression |
+## Input
 
-Removing either loss leaves the other's contribution intact:
+MuData is recommended. The RNA and ATAC modalities must have identical
+`obs_names`; Minuet currently models fully paired data only.
 
-- `mid_nocontrastive`: Wang scIB Total = **0.590** (vs full mid 0.591) — same
-  integration quality, but RNA↔ATAC retrieval collapses to 0.0024 (random).
-- `−contrastive` ablation on the no-CMI-BI baseline shows the same pattern:
-  retrieval at random floor.
+Concatenated AnnData is also supported when RNA features precede ATAC features:
 
-## Label-free false-negative cancellation
+```python
+Minuet.setup_anndata(adata, batch_key="donor")
+model = Minuet(adata, n_genes=20_000, n_regions=100_000, n_latent=32)
+```
 
-A plain cross-modal contrastive treats every other cell in the batch as a
-negative, including cells of the same biological state as the anchor. These false
-negatives dominate the gradient when cell types are few, and RNA↔ATAC retrieval
-degrades on low-diversity cohorts. `MinuetLosses.contrastive(..., fn_sim=τ)` drops,
-from each anchor's negatives, the cells that are similar to it in **both**
-modalities' shared codes (cosine > τ): likely same-state pairs. It uses only the
-embeddings — no cell-type labels or counts — and the absolute-similarity gate
-self-adapts: diverse cohorts trip it rarely, low-diversity cohorts often. Default
-`fn_sim = 0.6`. This is the same context principle as CMI-BI's conditional donor
-term: biology governs both which cells to contrast and which donor signal to
-remove.
+Raw counts should be supplied in `.X` or in the layer passed to
+`setup_mudata`/`setup_anndata`. Minuet fits RNA library normalization and ATAC
+TF-IDF weights using the training split.
 
-## Pareto pair (canonical recipes)
+When both `donor_key` and `context_key` are registered, training automatically
+uses exact-pair contrastive galleries matched within donor and observed
+context. If either is omitted, Minuet falls back to its label-free global
+contrastive objective.
 
-Both ship in `configs/`:
+`get_normalized_expression()` and `get_normalized_accessibility()` return
+non-negative decoder reconstructions on Minuet's log-normalized RNA and
+log-TF-IDF ATAC scales. They are API analogues of the MULTIVI methods, not
+negative-binomial posterior counts.
 
-| Recipe | η (CMI-BI weight) | class_key | role |
-|---|---:|---|---|
-| `minuet_mid.yaml`   | 0.15 | `type_updated` (~50 classes)  | integration axis (max scIB Total) |
-| `minuet_tuned.yaml` | 0.10 | `type_region`  (264 classes) | biology axis (max kNN classifier F1) |
-| `minuet_tuned_d32.yaml` | 0.10 | `type_region` | compact deploy (cell_dim=32, 4× smaller) |
+## Public API
 
-### Numbers (n=3 multi-seed, Wang in-distribution + ROSMAP cross-study)
+- `Minuet.setup_mudata(...)`
+- `Minuet.setup_anndata(...)`
+- `Minuet(...)`
+- `model.train(...)`
+- `model.get_latent_representation(...)`
+- `model.get_normalized_expression(...)`
+- `model.get_normalized_accessibility(...)`
+- `model.save(...)` and `Minuet.load(...)`
+- `model.to_device(...)`
 
-| Variant | Region F1 | Wang scIB | ROSMAP scIB | Wang MRR | ROSMAP MRR |
-|---|---:|---:|---:|---:|---:|
-| Minuet-mid (n=3) | 0.714 ± 0.008 | **0.591 ± 0.005** | **0.634 ± 0.002** | 0.0723 ± 0.0030 | 0.0194 ± 0.0005 |
-| Minuet-tuned (n=3) | **0.806 ± 0.002** | 0.543 ± 0.006 | 0.605 ± 0.003 | 0.0768 ± 0.0013 | 0.0205 ± 0.0004 |
-| Seurat WNN (RPCA+WNN) | 0.308 | 0.576 | — | — | — |
-| MultiVI (scVI-tools)  | 0.403 | 0.568 | — | — | — |
+Advanced low-level use remains available as `MinuetModule`, `MinuetConfig`, and
+`MinuetLosses`, but those are not needed for a normal analysis.
 
-Both Minuet variants beat both baselines on Region F1 by **2–2.5×**. Mid wins
-canonical scIB Total without post-hoc Harmony.
+## Scope
 
-`minuet_tuned_d32`: Region F1 = 0.770, Wang scIB = 0.552 — 4× smaller embedding
-than the d=128 versions; deploy point if storage / throughput matters.
-
-## Layout
-
-- `minuet/`     Python package (model, losses, data, CMI-BI auxiliary)
-- `configs/`    canonical recipe yamls
-- `scripts/`    train and evaluation entry points
-- `tests/`      unit tests
-- `docs/`       method notes and migration history
-
-## History
-
-Minuet is the publication-ready successor to the Apollo working package. The
-underlying model architecture (factorised modality encoders + PoE shared-token
-fusion + Gaussian decoder, 2026-04-27 vintage) is identical; the rename
-reflects a sharper architectural identity around the contrastive ↔ CMI-BI
-decomposition rather than the original "foundation model" framing. See
-`docs/from_apollo.md` for the migration mapping.
+The current release intentionally supports the reliable common path: fully
+paired RNA+ATAC integration. It does not claim MultiVI's unpaired-data,
+protein-modality, differential-expression, or scArches query-training features.

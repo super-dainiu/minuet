@@ -4,10 +4,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "minuet"
-version = "0.1.0"
-description = "Two-loss decomposition for paired snRNA+snATAC multiome integration"
+version = "0.2.0"
+description = "Paired single-cell RNA and ATAC integration with a scvi-style API"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.10"
 license = {text = "Apache-2.0"}
 authors = [
     {name = "Yanjun Shao"},
@@ -15,7 +15,9 @@ authors = [
 classifiers = [
     "License :: OSI Approved :: Apache Software License",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
     "Topic :: Scientific/Engineering :: Bio-Informatics",
 ]
 
@@ -24,18 +26,15 @@ dependencies = [
     "numpy",
     "pandas",
     "scipy",
-    "scikit-learn",
     "anndata",
-    "pyyaml",
 ]
 
 [project.optional-dependencies]
-eval = [
-    "scib-metrics",
-    "umap-learn",
-    "matplotlib",
-    "seaborn",
-]
+mudata = ["mudata>=0.3"]
+dev = ["build", "pytest"]
 
 [tool.setuptools.packages.find]
 include = ["minuet*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

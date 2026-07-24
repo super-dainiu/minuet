@@ -1,23 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from pathlib import Path
 
 import numpy as np
-import pandas as pd
 import scipy.sparse as sp
 import torch
 from torch.utils.data import Dataset
-
-
-def load_split_prefixes(split_csv: str | Path) -> dict[str, str]:
-    frame = pd.read_csv(split_csv)
-    return dict(zip(frame["sample_prefix"], frame["split"]))
-
-
-def load_split_rows(split_path: str | Path, split: str) -> np.ndarray:
-    split_data = np.load(split_path)
-    return np.asarray(split_data[split], dtype=np.int64)
 
 
 @dataclass(frozen=True)
@@ -106,6 +94,8 @@ class PairedSparseDataset(Dataset):
         transforms: PairedTransforms,
         batch_idx: np.ndarray | None = None,
         label_idx: np.ndarray | None = None,
+        donor_idx: np.ndarray | None = None,
+        context_idx: np.ndarray | None = None,
     ) -> None:
         self.rna = rna_csr
         self.atac = atac_csr
@@ -115,6 +105,8 @@ class PairedSparseDataset(Dataset):
         # Optional context label (e.g. cell type) for conditional losses
         # (conditional CLUB / CCL / HSIC). -1 marks an unlabelled cell.
         self.label_idx = None if label_idx is None else np.asarray(label_idx, dtype=np.int64)
+        self.donor_idx = None if donor_idx is None else np.asarray(donor_idx, dtype=np.int64)
+        self.context_idx = None if context_idx is None else np.asarray(context_idx, dtype=np.int64)
 
     def __len__(self) -> int:
         return int(self.indices.shape[0])
@@ -140,131 +132,8 @@ class PairedSparseDataset(Dataset):
             out["atac_batch_idx"] = batch_idx
         if self.label_idx is not None:
             out["label_idx"] = torch.tensor(int(self.label_idx[idx]), dtype=torch.long)
+        if self.donor_idx is not None:
+            out["donor_idx"] = torch.tensor(int(self.donor_idx[idx]), dtype=torch.long)
+        if self.context_idx is not None:
+            out["context_idx"] = torch.tensor(int(self.context_idx[idx]), dtype=torch.long)
         return out
-
-
-class SparseModalityDataset(Dataset):
-    def __init__(
-        self,
-        matrix_csr: sp.csr_matrix,
-        indices: np.ndarray,
-        modality: str,
-        transforms: PairedTransforms,
-        batch_idx: np.ndarray | None = None,
-    ) -> None:
-        if modality not in {"rna", "atac"}:
-            raise ValueError(f"Unsupported modality: {modality}")
-
-        self.matrix = matrix_csr
-        self.indices = np.asarray(indices, dtype=np.int64)
-        self.modality = modality
-        self.transforms = transforms
-        self.batch_idx = None if batch_idx is None else np.asarray(batch_idx, dtype=np.int64)
-
-    def __len__(self) -> int:
-        return int(self.indices.shape[0])
-
-    def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
-        row = int(self.indices[idx])
-        x = self.matrix[row].toarray().ravel().astype(np.float32, copy=False)
-
-        if self.modality == "rna":
-            x = transform_rna_dense(x, target_sum=self.transforms.rna_target_sum)
-        else:
-            if self.transforms.atac_idf is None:
-                raise ValueError("PairedTransforms.atac_idf must be set for ATAC data")
-            x = transform_atac_dense(x, self.transforms.atac_idf, target_sum=self.transforms.atac_target_sum)
-
-        out = {self.modality: torch.from_numpy(x)}
-        if self.batch_idx is not None:
-            out[f"{self.modality}_batch_idx"] = torch.tensor(int(self.batch_idx[idx]), dtype=torch.long)
-        return out
-
-
-def load_sparse_npz(path: str | Path) -> sp.csr_matrix:
-    mat = sp.load_npz(path)
-    if not sp.isspmatrix_csr(mat):
-        mat = mat.tocsr()
-    return mat
-
-
-def resolve_artifact_matrix(artifact_dir: str | Path, modality: str) -> Path:
-    root = Path(artifact_dir)
-    if modality == "rna":
-        candidates = [
-            root / "rna.npz",
-            root / "rna_top.npz",
-            root / "wang_rna_top.npz",
-        ]
-    elif modality == "atac":
-        candidates = [
-            root / "atac.npz",
-            root / "atac_top.npz",
-            root / "wang_atac_top.npz",
-        ]
-    else:
-        raise ValueError(f"Unsupported modality: {modality}")
-
-    for candidate in candidates:
-        if candidate.exists():
-            return candidate
-    raise FileNotFoundError(f"No {modality} matrix found under {root}")
-
-
-def resolve_artifact_splits(artifact_dir: str | Path) -> Path:
-    root = Path(artifact_dir)
-    candidates = [
-        root / "splits.npz",
-        root / "split_indices.npz",
-        root / "wang_split_indices.npz",
-    ]
-    for candidate in candidates:
-        if candidate.exists():
-            return candidate
-    raise FileNotFoundError(f"No split file found under {root}")
-
-
-def load_artifact_split_rows(artifact_dir: str | Path, split: str) -> np.ndarray:
-    return load_split_rows(resolve_artifact_splits(artifact_dir), split)
-
-
-def load_feature_names(artifact_dir: str | Path, modality: str) -> list[str] | None:
-    root = Path(artifact_dir)
-    if modality == "rna":
-        candidates = [
-            root / "selected_rna_features.json",
-            root / "rna_features.json",
-            root / "feature_names.json",
-        ]
-    elif modality == "atac":
-        candidates = [
-            root / "selected_atac_features.json",
-            root / "atac_features.json",
-            root / "feature_names.json",
-        ]
-    else:
-        raise ValueError(f"Unsupported modality: {modality}")
-
-    for candidate in candidates:
-        if candidate.exists():
-            import json
-
-            return list(json.loads(candidate.read_text()))
-    return None
-
-
-def assert_matching_feature_space(artifact_dirs: list[str | Path], modality: str) -> list[str] | None:
-    reference: list[str] | None = None
-    for artifact_dir in artifact_dirs:
-        features = load_feature_names(artifact_dir, modality)
-        if features is None:
-            continue
-        if reference is None:
-            reference = features
-            continue
-        if features != reference:
-            raise ValueError(
-                f"{modality} feature space mismatch between artifacts; "
-                "all mixed-pretraining artifacts must share the same selected feature vocabulary"
-            )
-    return reference
