@@ -110,12 +110,17 @@ class NuisanceBatchPredictor(nn.Module):
 class GaussianHead(nn.Module):
     def __init__(self, input_dim: int, latent_dim: int, min_logvar: float, max_logvar: float) -> None:
         super().__init__()
-        self.mu = nn.Linear(input_dim, latent_dim)
-        self.logvar = nn.Linear(input_dim, latent_dim)
+        self.latent_dim = int(latent_dim)
+        self.mu = nn.Linear(input_dim, latent_dim) if latent_dim > 0 else None
+        self.logvar = nn.Linear(input_dim, latent_dim) if latent_dim > 0 else None
         self.min_logvar = min_logvar
         self.max_logvar = max_logvar
 
     def forward(self, x: Tensor) -> tuple[Tensor, Tensor]:
+        if self.latent_dim == 0:
+            empty = x.new_empty((x.shape[0], 0))
+            return empty, empty
+        assert self.mu is not None and self.logvar is not None
         mu = self.mu(x)
         logvar = self.logvar(x).clamp(min=self.min_logvar, max=self.max_logvar)
         return mu, logvar
@@ -443,7 +448,7 @@ class FactorizedModalityDecoder(nn.Module):
         return self.shared_decoder(self._merge_covariate(x, batch_cov))
 
 
-class Minuet(nn.Module):
+class MinuetModule(nn.Module):
     def __init__(self, config: MinuetConfig) -> None:
         super().__init__()
         self.config = config
@@ -704,3 +709,7 @@ class Minuet(nn.Module):
                 out["nuisance_pred_target"] = batch_idx_for_nuisance.long()
 
         return out
+
+
+# Backward-compatible low-level import for pre-0.2 research code.
+Minuet = MinuetModule

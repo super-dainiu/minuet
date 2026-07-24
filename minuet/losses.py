@@ -5,6 +5,65 @@ from torch import Tensor
 from torch.nn import functional as F
 
 
+def _context_rms_standardize(z: Tensor, group: Tensor, eps: float = 1.0e-6) -> Tensor:
+    standardized = torch.zeros_like(z)
+    for value in torch.unique(group):
+        idx = torch.nonzero(group == value, as_tuple=False).squeeze(-1)
+        centered = z[idx] - z[idx].mean(dim=0, keepdim=True)
+        rms = centered.square().mean(dim=0, keepdim=True).clamp_min(eps * eps).sqrt()
+        standardized = standardized.index_copy(0, idx, centered / rms)
+    return standardized
+
+
+def _within_group_exact_pair(
+    rna: Tensor,
+    atac: Tensor,
+    donor: Tensor,
+    context: Tensor,
+    *,
+    temperature: float,
+    standardize: bool,
+) -> Tensor:
+    labelled = (donor >= 0) & (context >= 0)
+    rna = rna[labelled]
+    atac = atac[labelled]
+    donor = donor[labelled]
+    context = context[labelled]
+    if rna.shape[0] == 0:
+        return rna.sum() + atac.sum()
+    if standardize:
+        pairs = torch.stack((donor, context), dim=1)
+        _, group = torch.unique(pairs, dim=0, return_inverse=True)
+        rna = _context_rms_standardize(rna, group)
+        atac = _context_rms_standardize(atac, group)
+    context_terms = []
+    for context_value in torch.unique(context):
+        donor_terms = []
+        for donor_value in torch.unique(donor[context == context_value]):
+            idx = torch.nonzero(
+                (context == context_value) & (donor == donor_value),
+                as_tuple=False,
+            ).squeeze(-1)
+            if idx.numel() < 2:
+                continue
+            rna_group = F.normalize(rna[idx], dim=-1)
+            atac_group = F.normalize(atac[idx], dim=-1)
+            logits = (rna_group @ atac_group.T) / temperature
+            labels = torch.arange(idx.numel(), device=logits.device)
+            donor_terms.append(
+                0.5
+                * (
+                    F.cross_entropy(logits, labels)
+                    + F.cross_entropy(logits.T, labels)
+                )
+            )
+        if donor_terms:
+            context_terms.append(torch.stack(donor_terms).mean())
+    if not context_terms:
+        return rna.sum() * 0.0 + atac.sum() * 0.0
+    return torch.stack(context_terms).mean()
+
+
 class MinuetLosses:
     @staticmethod
     def reconstruction(x: Tensor, x_hat: Tensor) -> Tensor:
@@ -12,7 +71,8 @@ class MinuetLosses:
 
     @staticmethod
     def contrastive(x_shared: Tensor, y_shared: Tensor, temperature: float = 0.07,
-                    fn_sim: float = 0.0) -> Tensor:
+                    fn_sim: float = 0.0, alignment_mode: str = "legacy_fnc",
+                    donor: Tensor | None = None, context: Tensor | None = None) -> Tensor:
         """Symmetric cross-modal InfoNCE with label-free false-negative cancellation.
 
         A plain contrastive treats every other cell in the batch as a negative,
@@ -24,12 +84,25 @@ class MinuetLosses:
         so it needs no cell-type labels, and the absolute-similarity gate self-adapts
         -- diverse cohorts trip it rarely, low-diversity cohorts often.
         """
+        if alignment_mode in {"within_group_exact_pair", "within_group_raw_exact_pair"}:
+            if donor is None or context is None:
+                raise ValueError(f"{alignment_mode} requires donor and context labels")
+            return _within_group_exact_pair(
+                x_shared,
+                y_shared,
+                donor,
+                context,
+                temperature=temperature,
+                standardize=alignment_mode == "within_group_exact_pair",
+            )
+        if alignment_mode not in {"legacy_fnc", "global_exact_pair"}:
+            raise ValueError(f"unknown alignment_mode: {alignment_mode!r}")
         x = F.normalize(x_shared, dim=-1)
         y = F.normalize(y_shared, dim=-1)
         logits = (x @ y.T) / temperature
         n = x.shape[0]
         labels = torch.arange(n, device=x.device)
-        if fn_sim > 0.0:
+        if alignment_mode == "legacy_fnc" and fn_sim > 0.0:
             with torch.no_grad():
                 eye = torch.eye(n, dtype=torch.bool, device=x.device)
                 false_neg = (x @ x.T > fn_sim) & (y @ y.T > fn_sim) & ~eye
@@ -88,6 +161,9 @@ class MinuetLosses:
         nuisance_pred_weight: float = 0.0,
         temperature: float = 0.07,
         fn_sim: float = 0.0,
+        alignment_mode: str = "legacy_fnc",
+        alignment_donor: Tensor | None = None,
+        alignment_context: Tensor | None = None,
     ) -> dict[str, Tensor]:
         losses: dict[str, Tensor] = {}
 
@@ -117,7 +193,15 @@ class MinuetLosses:
 
         if rna_x is not None and atac_x is not None:
             losses["alignment"] = cls.alignment(out["rna_shared"], out["atac_shared"])
-            losses["contrastive"] = cls.contrastive(out["rna_shared"], out["atac_shared"], temperature=temperature, fn_sim=fn_sim)
+            losses["contrastive"] = cls.contrastive(
+                out["rna_shared"],
+                out["atac_shared"],
+                temperature=temperature,
+                fn_sim=fn_sim,
+                alignment_mode=alignment_mode,
+                donor=alignment_donor,
+                context=alignment_context,
+            )
             losses["joint_cell_kl"] = cls.gaussian_kl(out["joint_cell_mu"], out["joint_cell_logvar"])
             losses["joint_context_kl"] = cls.gaussian_kl(out["joint_context_mu"], out["joint_context_logvar"])
             losses["cell_fusion_consistency"] = 0.5 * (

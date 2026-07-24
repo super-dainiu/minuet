@@ -1,50 +1,30 @@
-# Apollo → Minuet migration
+# Migrating from the internal Apollo/Minuet code
 
-Minuet is a clean publication fork of the Apollo working package. The model
-architecture and losses are unchanged — what differs is naming, scope, and
-exposed API.
+Version 0.2 separates the public analysis API from the research implementation.
+Experiment launchers, artifact paths, wandb configuration, and paper-specific
+checkpoint factories are intentionally not part of this package.
 
-## Renames
+## Public workflow
 
-| Apollo (working) | Minuet (publication) |
-|---|---|
-| `software/apollo/` | `software/minuet/` |
-| python package `apollo` | python package `minuet` |
-| `ApolloV3`, `ApolloV3Config` | `Minuet`, `MinuetConfig` |
-| `ApolloV3Losses` | `MinuetLosses` |
+Old internal code manually created `MinuetConfig`, datasets, optimizers, and
+losses. External analyses should now use:
 
-## Dropped (no longer shipped)
+```python
+from minuet import Minuet
 
-The publication package keeps only the canonical recipe (formerly Apollo-V3).
-The earlier scaffolds are still in `software/apollo/` for ongoing experiments
-but are not part of Minuet:
+Minuet.setup_mudata(mdata, batch_key="donor")
+model = Minuet(mdata, n_latent=32)
+model.train()
+latent = model.get_latent_representation()
+```
 
-- `apollo.ApolloV1`, `apollo.ApolloLosses` (v1 baseline, no PoE fusion)
-- `apollo.ApolloV2`, `apollo.ApolloV2Losses` (intermediate scaffold)
-- `apollo.ApolloV4`, `apollo.ApolloV4Config` (Perceiver-style cross-attention iters)
+The low-level network is still available as `MinuetModule` for research code
+that needs direct PyTorch access. `MinuetConfig` and `MinuetLosses` remain
+available from the top-level package.
 
-## Kept identical
+## Compatibility boundary
 
-The internals of the canonical recipe are byte-identical:
-
-- `cmi_bi.py` — Conditional Mutual Information batch-invariance auxiliary network
-- `data.py` — paired multiome dataset loader + dataset-aware sampler
-- `tracking.py` — wandb integration utilities
-
-## Config naming
-
-| Apollo recipe | Minuet recipe |
-|---|---|
-| `apollo_fm_0427_cmibi_mid.yaml` | `configs/minuet_mid.yaml` |
-| `apollo_fm_0427_cmibi_tuned.yaml` | `configs/minuet_tuned.yaml` |
-| `apollo_fm_0427_cmibi_tuned_d32.yaml` | `configs/minuet_tuned_d32.yaml` |
-
-Other Apollo configs (mask sweep, multi-seed, ablations) stay under
-`software/apollo/configs/` since they're working artefacts, not part of the
-publication.
-
-## Checkpoints
-
-Apollo-trained checkpoints **load into Minuet** via
-`load_compatible_state_dict`. The state-dict keys for the v3 architecture
-were never renamed — only the wrapping class.
+The public model supports fully paired RNA and ATAC observations. Internal
+Apollo checkpoints should continue to be evaluated with the corresponding
+frozen research code; they are not silently reinterpreted as version 0.2
+public-model checkpoints.
