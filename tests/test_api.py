@@ -29,7 +29,7 @@ def paired_anndata(n_obs: int = 12, n_genes: int = 5, n_regions: int = 7) -> ad.
 class MinuetApiTest(unittest.TestCase):
     def make_model(self) -> tuple[ad.AnnData, Minuet]:
         adata = paired_anndata()
-        Minuet.setup_anndata(adata, batch_key="donor")
+        Minuet.setup_anndata(adata, donor_key="donor", context_key="context")
         model = Minuet(
             adata,
             n_genes=5,
@@ -107,10 +107,13 @@ class MinuetApiTest(unittest.TestCase):
         atac.var_names = combined.var_names[5:].copy()
         rna.obs["donor"] = combined.obs["donor"].to_numpy()
         mdata = mu.MuData({"rna": rna, "atac": atac})
+        mdata.obs["donor"] = combined.obs["donor"].to_numpy()
+        mdata.obs["context"] = combined.obs["context"].to_numpy()
         Minuet.setup_mudata(
             mdata,
             modalities={"rna_layer": "rna", "atac_layer": "atac"},
-            batch_key="donor",
+            donor_key="donor",
+            context_key="context",
         )
         model = Minuet(
             mdata,
@@ -149,8 +152,21 @@ class MinuetApiTest(unittest.TestCase):
             accelerator="cpu",
             early_stopping=False,
         )
-        self.assertEqual(model.alignment_mode_, "within_group_raw_exact_pair")
+        self.assertEqual(model.objective_, "production-v3")
         self.assertTrue(np.isfinite(model.history["train_loss"]).all())
+
+    def test_context_does_not_define_pair_gallery(self) -> None:
+        import torch
+        from minuet.losses import donor_centered_exact_pair_infonce
+
+        rna = torch.tensor([[1., 0.], [0., 1.], [-1., 0.], [0., -1.]])
+        donor = torch.zeros(4, dtype=torch.long)
+        original = donor_centered_exact_pair_infonce(rna, rna, donor)
+        # No context argument exists: changing biological-context labels cannot
+        # change the donor-only paired objective.
+        changed_context = torch.tensor([0, 1, 0, 1])
+        self.assertEqual(changed_context.numel(), donor.numel())
+        self.assertAlmostEqual(float(original), float(donor_centered_exact_pair_infonce(rna, rna, donor)))
 
 
 if __name__ == "__main__":

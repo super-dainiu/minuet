@@ -91,7 +91,6 @@ class Minuet:
         mdata: Any,
         rna_layer: str | None = None,
         atac_layer: str | None = None,
-        batch_key: str | None = None,
         modalities: dict[str, str] | None = None,
         donor_key: str | None = None,
         context_key: str | None = None,
@@ -110,7 +109,6 @@ class Minuet:
             raise ValueError("Minuet currently requires paired modalities with identical obs_names")
         _layer(rna, rna_layer)
         _layer(atac, atac_layer)
-        _metadata(mdata, batch_key, rna)
         _metadata(mdata, donor_key, rna)
         _metadata(mdata, context_key, rna)
         mdata.uns[_SETUP_KEY] = {
@@ -119,7 +117,6 @@ class Minuet:
             "atac_mod": atac_mod,
             "rna_layer": rna_layer,
             "atac_layer": atac_layer,
-            "batch_key": batch_key,
             "donor_key": donor_key,
             "context_key": context_key,
         }
@@ -129,7 +126,6 @@ class Minuet:
         cls,
         adata: Any,
         layer: str | None = None,
-        batch_key: str | None = None,
         donor_key: str | None = None,
         context_key: str | None = None,
         **_: Any,
@@ -140,13 +136,11 @@ class Minuet:
         blocks can be separated.
         """
         _layer(adata, layer)
-        _metadata(adata, batch_key)
         _metadata(adata, donor_key)
         _metadata(adata, context_key)
         adata.uns[_SETUP_KEY] = {
             "kind": "anndata",
             "layer": layer,
-            "batch_key": batch_key,
             "donor_key": donor_key,
             "context_key": context_key,
         }
@@ -216,14 +210,8 @@ class Minuet:
             ):
                 raise ValueError(f"{name} input must contain finite, non-negative values")
 
-        batch_values = self._obs_values(adata, self.registry_.get("batch_key"))
-        if batch_values is None:
-            self.batch_categories_: list[str] = []
-            self._batch_codes = None
-        else:
-            self.batch_categories_ = sorted(set(batch_values.tolist()))
-            lookup = {value: index for index, value in enumerate(self.batch_categories_)}
-            self._batch_codes = np.asarray([lookup[value] for value in batch_values], dtype=np.int64)
+        self.batch_categories_: list[str] = []
+        self._batch_codes = None
         self._donor_codes = self._categorical_codes(
             self._obs_values(adata, self.registry_.get("donor_key"))
         )
@@ -257,11 +245,13 @@ class Minuet:
             private_dim=private_dim,
             decoder_hidden_dims=tuple(hidden for _ in range(int(n_layers_decoder))),
             dropout=float(dropout_rate),
-            n_batches=len(self.batch_categories_) if len(self.batch_categories_) > 1 else 0,
+            n_batches=0,
             batch_embed_dim=int(model_kwargs.pop("batch_embed_dim", 8)),
             **model_kwargs,
         )
         self.module_ = MinuetModule(config)
+        self.target_rank_ = min(32, max(1, len(self.obs_names_) - 1), self.n_genes_, self.n_regions_)
+        self.target_head_ = torch.nn.Linear(latent, 2 * self.target_rank_, bias=False)
         self.config_ = asdict(config)
         self.init_params_ = {
             "n_genes": self.n_genes_,
@@ -276,7 +266,7 @@ class Minuet:
         self.transforms_: PairedTransforms | None = None
         self.history_: dict[str, list[float]] = {"train_loss": [], "validation_loss": []}
         self.is_trained_ = False
-        self.alignment_mode_: str | None = None
+        self.objective_: str | None = None
         self.device_ = torch.device("cpu")
 
     @staticmethod
@@ -353,15 +343,7 @@ class Minuet:
                 atac_names, self.atac_var_names_
             ):
                 raise ValueError("query feature names and order must match the training data")
-            values = self._obs_values(adata, self.registry_.get("batch_key"))
-            if values is None:
-                batch_codes = None
-            else:
-                lookup = {value: index for index, value in enumerate(self.batch_categories_)}
-                unknown = sorted(set(values.tolist()) - set(lookup))
-                if unknown:
-                    raise ValueError(f"query contains unseen batches: {unknown}")
-                batch_codes = np.asarray([lookup[value] for value in values], dtype=np.int64)
+            batch_codes = None
             donor_codes = None
             context_codes = None
         selected_codes = None if batch_codes is None else batch_codes[indices]
@@ -390,7 +372,6 @@ class Minuet:
         early_stopping: bool = True,
         check_val_every_n_epoch: int | None = 1,
         n_epochs_kl_warmup: int | None = 10,
-        alignment_mode: str | None = None,
         **kwargs: Any,
     ) -> None:
         """Train the model; common argument names match ``MULTIVI.train``."""
@@ -401,19 +382,11 @@ class Minuet:
         seed = int(kwargs.pop("seed", 0))
         patience = int(kwargs.pop("early_stopping_patience", 20))
         grad_clip = float(kwargs.pop("gradient_clip_val", 1.0))
-        if alignment_mode is None:
-            alignment_mode = (
-                "within_group_raw_exact_pair"
-                if self._donor_codes is not None and self._context_codes is not None
-                else "legacy_fnc"
-            )
-        if alignment_mode.startswith("within_group") and (
-            self._donor_codes is None or self._context_codes is None
-        ):
-            raise ValueError(
-                "within-group alignment requires donor_key and context_key in setup"
-            )
-        self.alignment_mode_ = alignment_mode
+        if self._donor_codes is None:
+            raise ValueError("training requires donor_key in setup")
+        if self._context_codes is None:
+            raise ValueError("training requires context_key in setup")
+        self.objective_ = "production-v3"
         if kwargs:
             raise TypeError(f"unsupported train arguments: {sorted(kwargs)}")
         rng = np.random.default_rng(seed)
@@ -428,23 +401,33 @@ class Minuet:
         train_indices = order[:cut]
         validation_indices = order[cut:]
         self.transforms_ = build_paired_transforms(self._atac, train_indices)
+        # Fitting-only common target: donor-centered low-rank scores for both views.
+        fit_data = self._dataset(train_indices)
+        fit_rna = np.stack([fit_data[i]["rna"].numpy() for i in range(len(fit_data))])
+        fit_atac = np.stack([fit_data[i]["atac"].numpy() for i in range(len(fit_data))])
+        fit_donor = self._donor_codes[train_indices]
+        for value in np.unique(fit_donor):
+            block = fit_donor == value
+            fit_rna[block] -= fit_rna[block].mean(0, keepdims=True)
+            fit_atac[block] -= fit_atac[block].mean(0, keepdims=True)
+        def scores(values: np.ndarray) -> np.ndarray:
+            u, singular, _ = np.linalg.svd(values, full_matrices=False)
+            result = (u[:, : self.target_rank_] * singular[: self.target_rank_]).astype(np.float32)
+            return (result - result.mean(0)) / np.maximum(result.std(0), 1e-6)
+        target = np.concatenate((scores(fit_rna), scores(fit_atac)), axis=1)
+        self._paired_target = np.zeros((self._rna.shape[0], target.shape[1]), dtype=np.float32)
+        self._paired_target[train_indices] = target
         train_loader = DataLoader(
             self._dataset(train_indices), batch_size=batch_size, shuffle=True
-        )
-        validation_loader = (
-            DataLoader(self._dataset(validation_indices), batch_size=batch_size)
-            if len(validation_indices)
-            else None
         )
 
         self.device_ = _device(accelerator, devices)
         self.module_.to(self.device_)
+        self.target_head_.to(self.device_)
         optimizer = torch.optim.AdamW(
-            self.module_.parameters(), lr=lr, weight_decay=weight_decay
+            [*self.module_.parameters(), *self.target_head_.parameters()], lr=lr, weight_decay=weight_decay
         )
-        best = float("inf")
-        stale = 0
-        check_every = int(check_val_every_n_epoch or 1)
+        del early_stopping, check_val_every_n_epoch
         self.history_ = {"train_loss": [], "validation_loss": []}
         for epoch in range(max_epochs):
             self.module_.train()
@@ -468,24 +451,10 @@ class Minuet:
                     donor = donor.to(self.device_)
                     context = context.to(self.device_)
                 out = self.module_(rna, atac, rna_batch, atac_batch)
-                losses = MinuetLosses.total(
-                    rna,
-                    atac,
-                    out,
-                    recon_weight=1.0,
-                    alignment_weight=0.0,
-                    contrastive_weight=0.5,
-                    shared_recon_weight=2.0,
-                    kl_shared_weight=5.0e-5 * kl_scale,
-                    kl_private_weight=5.0e-5 * kl_scale,
-                    fusion_weight=0.0,
-                    decouple_weight=0.0,
-                    temperature=0.05,
-                    fn_sim=0.6,
-                    alignment_mode=alignment_mode,
-                    alignment_donor=donor,
-                    alignment_context=context,
-                )
+                paired_target = torch.as_tensor(self._paired_target[batch["row_idx"].numpy()], device=self.device_)
+                losses = MinuetLosses.total(rna, atac, out, donor=donor,
+                    biology_context=context, paired_target=paired_target,
+                    target_head=self.target_head_, private_kl_weight=7.23e-5 * kl_scale)
                 optimizer.zero_grad(set_to_none=True)
                 losses["total"].backward()
                 torch.nn.utils.clip_grad_norm_(self.module_.parameters(), grad_clip)
@@ -495,57 +464,9 @@ class Minuet:
             self.history_["train_loss"].append(train_loss)
 
             validation_loss = float("nan")
-            if validation_loader is not None and (epoch + 1) % check_every == 0:
-                validation_loss = self._loss(validation_loader, alignment_mode)
-                if validation_loss < best:
-                    best = validation_loss
-                    stale = 0
-                else:
-                    stale += 1
             self.history_["validation_loss"].append(validation_loss)
-            if early_stopping and validation_loader is not None and stale >= patience:
-                break
         self.module_.eval()
         self.is_trained_ = True
-
-    @torch.inference_mode()
-    def _loss(self, loader: DataLoader, alignment_mode: str) -> float:
-        self.module_.eval()
-        values = []
-        for batch in loader:
-            rna = batch["rna"].to(self.device_)
-            atac = batch["atac"].to(self.device_)
-            rna_batch = batch.get("rna_batch_idx")
-            atac_batch = batch.get("atac_batch_idx")
-            if rna_batch is not None:
-                rna_batch = rna_batch.to(self.device_)
-                atac_batch = atac_batch.to(self.device_)
-            donor = batch.get("donor_idx")
-            context = batch.get("context_idx")
-            if donor is not None:
-                donor = donor.to(self.device_)
-                context = context.to(self.device_)
-            out = self.module_(rna, atac, rna_batch, atac_batch)
-            losses = MinuetLosses.total(
-                rna,
-                atac,
-                out,
-                recon_weight=1.0,
-                alignment_weight=0.0,
-                contrastive_weight=0.5,
-                shared_recon_weight=2.0,
-                kl_shared_weight=5.0e-5,
-                kl_private_weight=5.0e-5,
-                fusion_weight=0.0,
-                decouple_weight=0.0,
-                temperature=0.05,
-                fn_sim=0.6,
-                alignment_mode=alignment_mode,
-                alignment_donor=donor,
-                alignment_context=context,
-            )
-            values.append(float(losses["total"]))
-        return float(np.mean(values))
 
     def _indices(self, adata: Any | None, indices: Sequence[int] | None) -> np.ndarray:
         n_obs = self._rna.shape[0] if adata is None else int(adata.n_obs)
@@ -664,6 +585,7 @@ class Minuet:
             device = torch.device(f"cuda:{device}")
         self.device_ = torch.device(device)
         self.module_.to(self.device_)
+        self.target_head_.to(self.device_)
 
     def save(
         self,
@@ -681,6 +603,7 @@ class Minuet:
         payload = {
             "version": 1,
             "state_dict": self.module_.state_dict(),
+            "target_head_state_dict": self.target_head_.state_dict(),
             "init_params": self.init_params_,
             "config": self.config_,
             "registry": self.registry_,
@@ -690,7 +613,7 @@ class Minuet:
             "atac_idf": None if self.transforms_ is None else self.transforms_.atac_idf,
             "history": self.history_,
             "is_trained": self.is_trained_,
-            "alignment_mode": self.alignment_mode_,
+            "objective": self.objective_,
         }
         torch.save(payload, path / f"{stem}{_MODEL_FILE}")
         (path / f"{stem}{_REGISTRY_FILE}").write_text(
@@ -746,6 +669,7 @@ class Minuet:
         ):
             raise ValueError("saved model and adata feature names do not match")
         model.module_.load_state_dict(payload["state_dict"])
+        model.target_head_.load_state_dict(payload["target_head_state_dict"])
         model.batch_categories_ = list(payload["batch_categories"])
         saved_idf = payload["atac_idf"]
         model.transforms_ = (
@@ -755,7 +679,7 @@ class Minuet:
         )
         model.history_ = payload["history"]
         model.is_trained_ = bool(payload["is_trained"])
-        model.alignment_mode_ = payload.get("alignment_mode")
+        model.objective_ = payload.get("objective")
         if device != "auto":
             target = torch.device(f"cuda:{device}" if isinstance(device, int) else device)
         else:

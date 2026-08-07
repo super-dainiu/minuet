@@ -42,13 +42,7 @@ class MinuetConfig:
     # Trained with gradient reversal on the shared latent
     adversarial_batch: bool = False
     adversary_hidden: int = 64
-    # Structured-latent (Option A): re-task the context head as an explicit
-    # nuisance absorber. A non-reversed batch classifier on context_mu pushes
-    # context to be batch-predictive; the existing cell_context_decouple
-    # cross-covariance penalty keeps cell (= z_bio) orthogonal to context
-    # (= z_res). Downstream uses only cell as the shared embedding. Identifiability:
-    # under auxiliary-variability + Bayes-optimal nuisance head, z_bio is
-    # identified up to a y-equivariant invertible map (paper Theorem A.1).
+    # Optional structured-latent research configuration; disabled by the API.
     structured_latent: bool = False
     nuisance_pred_hidden: int = 64
 
@@ -301,9 +295,7 @@ class FactorizedModalityEncoder(nn.Module):
             else None
         )
         self.token_type_embed = nn.Parameter(torch.randn(1, 5, token_dim) * 0.02)
-        # Depth lives in the modality-specific feature encoder, followed by a shallower
-        # joint encoder over latent tokens plus encoded feature tokens. This is closer
-        # to APOLLO's encoder->shared/private latent geometry than a Perceiver bottleneck.
+        # Modality-specific feature blocks precede the joint latent blocks.
         self.feature_blocks = nn.ModuleList(
             [
                 SelfAttentionBlock(

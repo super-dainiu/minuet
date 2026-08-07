@@ -102,8 +102,7 @@ class PairedSparseDataset(Dataset):
         self.indices = np.asarray(indices, dtype=np.int64)
         self.transforms = transforms
         self.batch_idx = None if batch_idx is None else np.asarray(batch_idx, dtype=np.int64)
-        # Optional context label (e.g. cell type) for conditional losses
-        # (conditional CLUB / CCL / HSIC). -1 marks an unlabelled cell.
+        # Optional recorded biological context for within-context association.
         self.label_idx = None if label_idx is None else np.asarray(label_idx, dtype=np.int64)
         self.donor_idx = None if donor_idx is None else np.asarray(donor_idx, dtype=np.int64)
         self.context_idx = None if context_idx is None else np.asarray(context_idx, dtype=np.int64)
@@ -125,6 +124,7 @@ class PairedSparseDataset(Dataset):
         out = {
             "rna": torch.from_numpy(rna),
             "atac": torch.from_numpy(atac),
+            "row_idx": torch.tensor(row, dtype=torch.long),
         }
         if self.batch_idx is not None:
             batch_idx = torch.tensor(int(self.batch_idx[idx]), dtype=torch.long)
