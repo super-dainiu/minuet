@@ -1,97 +1,225 @@
-"""Production Minuet v3 objectives.
-
-Donor labels define the paired galleries and paired-target centering. Recorded
-biological context is used only to measure residual donor association.
-"""
+"""Production Minuet objectives used only while fitting the encoder."""
 from __future__ import annotations
 
 import torch
-from torch import Tensor
+from torch import Tensor, nn
 from torch.nn import functional as F
 
 
+PAIR_WEIGHT = 1.9435173526733809
+PAIR_TEMPERATURE = 0.08808674812619335
+PRIVATE_KL_WEIGHT = 7.231904795762552e-5
+PAIRED_TARGET_RANK = 32
+PAIRED_TARGET_WEIGHT = 1.5841466269183442
+DONOR_ASSOCIATION_WEIGHT = 0.11343234492276047
+COVARIANCE_AGREEMENT_WEIGHT = 0.3423206519502428
+COVARIANCE_START_FRACTION = 0.789253759592594
+
+
 def donor_centered_exact_pair_infonce(
-    rna: Tensor, atac: Tensor, donor: Tensor, *, temperature: float = 0.05
+    rna: Tensor,
+    atac: Tensor,
+    donor: Tensor,
+    *,
+    temperature: float = PAIR_TEMPERATURE,
+    eps: float = 1.0e-6,
 ) -> Tensor:
-    """Symmetric exact-pair InfoNCE, centered and averaged by donor."""
+    """Symmetric exact-pair InfoNCE within separately centered donor blocks."""
+    if rna.ndim != 2 or atac.shape != rna.shape or donor.shape != (rna.shape[0],):
+        raise ValueError("paired embeddings and donor labels have incompatible shapes")
+    if temperature <= 0:
+        raise ValueError("temperature must be positive")
     terms: list[Tensor] = []
     for value in torch.unique(donor[donor >= 0]):
-        idx = torch.nonzero(donor == value, as_tuple=False).flatten()
-        if idx.numel() < 2:
+        index = torch.nonzero(donor == value, as_tuple=False).flatten()
+        if index.numel() < 2:
             continue
-        x = F.normalize(rna[idx] - rna[idx].mean(0, keepdim=True), dim=-1)
-        y = F.normalize(atac[idx] - atac[idx].mean(0, keepdim=True), dim=-1)
+        x = F.normalize(
+            rna[index] - rna[index].mean(dim=0, keepdim=True), dim=-1, eps=eps
+        )
+        y = F.normalize(
+            atac[index] - atac[index].mean(dim=0, keepdim=True), dim=-1, eps=eps
+        )
         logits = x @ y.T / temperature
-        labels = torch.arange(idx.numel(), device=rna.device)
-        terms.append(0.5 * (F.cross_entropy(logits, labels) + F.cross_entropy(logits.T, labels)))
+        labels = torch.arange(index.numel(), device=rna.device)
+        terms.append(
+            0.5
+            * (
+                F.cross_entropy(logits, labels)
+                + F.cross_entropy(logits.T, labels)
+            )
+        )
     return torch.stack(terms).mean() if terms else (rna.sum() + atac.sum()) * 0.0
 
 
-def donor_centered_smooth_l1(prediction: Tensor, target: Tensor, donor: Tensor) -> Tensor:
-    """Smooth-L1 after separate within-donor centering; donors are equally weighted."""
+def donor_centered_smooth_l1(
+    prediction: Tensor, target: Tensor, donor: Tensor
+) -> Tensor:
+    """Within-donor centered Smooth-L1 with equal donor weighting."""
+    if prediction.ndim != 2 or prediction.shape != target.shape:
+        raise ValueError("prediction and target must have the same 2D shape")
+    if donor.shape != (prediction.shape[0],):
+        raise ValueError("donor must have one value per prediction")
     terms: list[Tensor] = []
     for value in torch.unique(donor[donor >= 0]):
         block = donor == value
         if int(block.sum()) < 2:
             continue
-        pred = prediction[block] - prediction[block].mean(0, keepdim=True)
-        truth = target[block] - target[block].mean(0, keepdim=True)
+        pred = prediction[block] - prediction[block].mean(dim=0, keepdim=True)
+        truth = target[block] - target[block].mean(dim=0, keepdim=True)
         terms.append(F.smooth_l1_loss(pred, truth))
     return torch.stack(terms).mean() if terms else prediction.sum() * 0.0
 
 
 def context_centered_donor_association(
-    z: Tensor, donor: Tensor, biology_context: Tensor, *, eps: float = 1e-12
+    z: Tensor, donor: Tensor, biology_context: Tensor, *, eps: float = 1.0e-12
 ) -> Tensor:
-    """Normalized linear donor association, computed separately within contexts."""
-    terms: list[Tensor] = []
+    """Normalized linear donor association computed separately within contexts."""
     labelled = (donor >= 0) & (biology_context >= 0)
     if not labelled.any():
         return z.sum() * 0.0
     z, donor, biology_context = z[labelled], donor[labelled], biology_context[labelled]
-    n_donors = int(donor.max()) + 1
+    n_donors = int(donor.max().detach()) + 1
+    terms: list[Tensor] = []
     for value in torch.unique(biology_context):
-        idx = torch.nonzero(biology_context == value, as_tuple=False).flatten()
-        if idx.numel() < 4 or torch.unique(donor[idx]).numel() < 2:
+        index = torch.nonzero(biology_context == value, as_tuple=False).flatten()
+        if index.numel() < 4 or torch.unique(donor[index]).numel() < 2:
             continue
-        x = z[idx] - z[idx].mean(0, keepdim=True)
-        d = F.one_hot(donor[idx], n_donors).to(z.dtype)
-        d = d - d.mean(0, keepdim=True)
+        x = z[index] - z[index].mean(dim=0, keepdim=True)
+        d = F.one_hot(donor[index], n_donors).to(z.dtype)
+        d = d - d.mean(dim=0, keepdim=True)
         numerator = (x.T @ d).square().sum()
-        denominator = ((x.T @ x).square().sum().sqrt() * (d.T @ d).square().sum().sqrt()).detach()
+        denominator = (
+            (x.T @ x).square().sum().sqrt()
+            * (d.T @ d).square().sum().sqrt()
+        ).detach()
         terms.append(numerator / denominator.clamp_min(eps))
     return torch.stack(terms).mean() if terms else z.sum() * 0.0
 
 
+def within_context_covariance_agreement(
+    z: Tensor,
+    donor: Tensor,
+    biology_context: Tensor,
+    *,
+    eps: float = 1.0e-8,
+) -> Tensor:
+    """Match trace-normalized donor covariances within each context."""
+    labelled = (donor >= 0) & (biology_context >= 0)
+    z, donor, biology_context = (
+        z[labelled], donor[labelled], biology_context[labelled]
+    )
+    context_terms: list[Tensor] = []
+    for context_value in torch.unique(biology_context):
+        in_context = biology_context == context_value
+        covariances: list[Tensor] = []
+        for donor_value in torch.unique(donor[in_context]):
+            block = in_context & (donor == donor_value)
+            n_cells = int(block.sum())
+            if n_cells < 2:
+                continue
+            centered = z[block] - z[block].mean(dim=0, keepdim=True)
+            covariance = centered.T @ centered / float(n_cells - 1)
+            covariance = covariance / covariance.diagonal().sum().clamp_min(eps)
+            covariances.append(covariance)
+        if len(covariances) < 2:
+            continue
+        stacked = torch.stack(covariances)
+        reference = stacked.mean(dim=0)
+        context_terms.append(
+            (stacked - reference).square().sum(dim=(-2, -1)).mean()
+        )
+    return torch.stack(context_terms).mean() if context_terms else z.sum() * 0.0
+
+
 def gaussian_kl(mu: Tensor, logvar: Tensor) -> Tensor:
-    return 0.5 * (mu.square() + logvar.exp() - 1.0 - logvar).sum(-1).mean()
+    return 0.5 * (mu.square() + logvar.exp() - 1.0 - logvar).sum(dim=-1).mean()
 
 
-class MinuetLosses:
-    """Small public collection matching the production v3 roles."""
+def negative_binomial_nll(
+    counts: Tensor, mean: Tensor, inverse_dispersion: Tensor, *, eps: float = 1.0e-8
+) -> Tensor:
+    if counts.shape != mean.shape:
+        raise ValueError("counts and NB mean must have identical shapes")
+    theta = inverse_dispersion.clamp_min(eps).unsqueeze(0)
+    mean = mean.clamp_min(eps)
+    log_prob = (
+        torch.lgamma(counts + theta)
+        - torch.lgamma(theta)
+        - torch.lgamma(counts + 1.0)
+        + theta * (torch.log(theta + eps) - torch.log(theta + mean))
+        + counts * (torch.log(mean) - torch.log(theta + mean))
+    )
+    return -log_prob
 
-    donor_centered_exact_pair_infonce = staticmethod(donor_centered_exact_pair_infonce)
-    donor_centered_smooth_l1 = staticmethod(donor_centered_smooth_l1)
-    context_centered_donor_association = staticmethod(context_centered_donor_association)
 
-    @classmethod
-    def total(
-        cls, rna_x: Tensor, atac_x: Tensor, out: dict[str, Tensor], *, donor: Tensor,
-        biology_context: Tensor, paired_target: Tensor, target_head: torch.nn.Module,
-        pair_weight: float = 2.466, prediction_weight: float = 0.1,
-        donor_association_weight: float = 0.1, private_kl_weight: float = 7.23e-5,
-        temperature: float = 0.0355,
+class MinuetLosses(nn.Module):
+    """Trial45 objective, including its bias-free fitting-only target head."""
+
+    def __init__(self, shared_dim: int, target_rank: int) -> None:
+        super().__init__()
+        if shared_dim <= 0 or target_rank <= 0:
+            raise ValueError("shared_dim and target_rank must be positive")
+        self.shared_paired_target_head = nn.Linear(
+            shared_dim, 2 * target_rank, bias=False
+        )
+
+    def forward(
+        self,
+        rna_counts: Tensor,
+        atac_counts: Tensor,
+        output: dict[str, Tensor],
+        *,
+        donor: Tensor,
+        biology_context: Tensor,
+        rna_target_score: Tensor,
+        atac_target_score: Tensor,
+        covariance_active: bool,
     ) -> dict[str, Tensor]:
         losses: dict[str, Tensor] = {}
-        losses["reconstruction"] = F.mse_loss(out["rna_recon"], rna_x) + F.mse_loss(out["atac_recon"], atac_x)
-        losses["private_kl"] = gaussian_kl(out["rna_private_mu"], out["rna_private_logvar"]) + gaussian_kl(out["atac_private_mu"], out["atac_private_logvar"])
-        losses["pair"] = donor_centered_exact_pair_infonce(out["rna_shared"], out["atac_shared"], donor, temperature=temperature)
-        losses["prediction"] = 0.5 * (
-            donor_centered_smooth_l1(target_head(out["rna_shared"]), paired_target, donor)
-            + donor_centered_smooth_l1(target_head(out["atac_shared"]), paired_target, donor)
+        losses["rna_reconstruction"] = negative_binomial_nll(
+            rna_counts, output["rna_rate"], output["rna_inverse_dispersion"]
+        ).mean()
+        losses["atac_reconstruction"] = F.binary_cross_entropy_with_logits(
+            output["atac_logits"], (atac_counts > 0).to(output["atac_logits"].dtype)
         )
-        losses["donor_association"] = context_centered_donor_association(out["joint_shared"], donor, biology_context)
-        losses["total"] = (losses["reconstruction"] + private_kl_weight * losses["private_kl"]
-                           + pair_weight * losses["pair"] + prediction_weight * losses["prediction"]
-                           + donor_association_weight * losses["donor_association"])
+        losses["private_kl"] = gaussian_kl(
+            output["rna_private"], output["rna_private_logvar"]
+        ) + gaussian_kl(output["atac_private"], output["atac_private_logvar"])
+        losses["pair"] = donor_centered_exact_pair_infonce(
+            output["rna_shared"], output["atac_shared"], donor
+        )
+        paired_target = torch.cat((rna_target_score, atac_target_score), dim=-1)
+        losses["prediction"] = 0.5 * (
+            donor_centered_smooth_l1(
+                self.shared_paired_target_head(output["rna_shared"]),
+                paired_target,
+                donor,
+            )
+            + donor_centered_smooth_l1(
+                self.shared_paired_target_head(output["atac_shared"]),
+                paired_target,
+                donor,
+            )
+        )
+        joint = 0.5 * (output["rna_shared"] + output["atac_shared"])
+        losses["donor_association"] = context_centered_donor_association(
+            joint, donor, biology_context
+        )
+        losses["covariance_agreement"] = within_context_covariance_agreement(
+            joint, donor, biology_context
+        )
+        losses["total"] = (
+            losses["rna_reconstruction"]
+            + losses["atac_reconstruction"]
+            + PRIVATE_KL_WEIGHT * losses["private_kl"]
+            + PAIR_WEIGHT * losses["pair"]
+            + PAIRED_TARGET_WEIGHT * losses["prediction"]
+            + DONOR_ASSOCIATION_WEIGHT * losses["donor_association"]
+        )
+        if covariance_active:
+            losses["total"] = (
+                losses["total"]
+                + COVARIANCE_AGREEMENT_WEIGHT * losses["covariance_agreement"]
+            )
         return losses

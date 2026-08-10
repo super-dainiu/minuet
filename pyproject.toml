@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "minuet"
-version = "0.2.0"
-description = "Paired single-cell RNA and ATAC integration with a scvi-style API"
+version = "0.3.0"
+description = "Compact population-level paired RNA and ATAC representation learning"
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "Apache-2.0"}
@@ -26,6 +26,7 @@ dependencies = [
     "numpy",
     "pandas",
     "scipy",
+    "scikit-learn",
     "anndata",
 ]
 

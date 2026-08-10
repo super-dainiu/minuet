@@ -1,139 +1,106 @@
+"""Raw-count batching for Minuet fitting and frozen-query encoding."""
 from __future__ import annotations
 
+from collections import defaultdict
 from dataclasses import dataclass
+from typing import Hashable, Iterator, Sequence
 
 import numpy as np
 import scipy.sparse as sp
 import torch
-from torch.utils.data import Dataset
 
 
 @dataclass(frozen=True)
-class PairedTransforms:
-    rna_target_sum: float = 1.0e4
-    atac_target_sum: float = 1.0e4
-    atac_idf: np.ndarray | None = None
+class PopulationBatchConfig:
+    contexts_per_batch: int = 2
+    donors_per_context: int = 4
+    cells_per_block: int = 12
+    batches_per_epoch: int = 100
+    seed: int = 0
+
+    def __post_init__(self) -> None:
+        if min(
+            self.contexts_per_batch,
+            self.donors_per_context,
+            self.cells_per_block,
+            self.batches_per_epoch,
+        ) <= 0:
+            raise ValueError("population batch settings must be positive")
+        if self.donors_per_context < 2 or self.cells_per_block < 2:
+            raise ValueError("population batches require at least two donors and cells")
 
 
-def build_atac_idf(
-    atac_sources: list[tuple[sp.csr_matrix, np.ndarray | None]],
-) -> np.ndarray:
-    if not atac_sources:
-        raise ValueError("atac_sources must not be empty")
+class PopulationBatchSampler:
+    """Deterministic equal-size donor-by-context block sampler."""
 
-    n_features = int(atac_sources[0][0].shape[1])
-    atac_counts = np.zeros(n_features, dtype=np.float64)
-    n_cells = 0.0
-
-    for atac_csr, rows in atac_sources:
-        if atac_csr.shape[1] != n_features:
-            raise ValueError("All ATAC sources must share the same feature dimension")
-
-        if rows is not None:
-            view = atac_csr[np.asarray(rows, dtype=np.int64)]
-        else:
-            view = atac_csr
-
-        atac_counts += np.bincount(view.indices, minlength=n_features)
-        n_cells += float(view.shape[0])
-
-    return np.log1p(n_cells / (1.0 + atac_counts)).astype(np.float32, copy=False)
-
-
-def build_paired_transforms(
-    atac_csr: sp.csr_matrix,
-    train_indices: np.ndarray | None = None,
-    rna_target_sum: float = 1.0e4,
-    atac_target_sum: float = 1.0e4,
-) -> PairedTransforms:
-    return PairedTransforms(
-        rna_target_sum=rna_target_sum,
-        atac_target_sum=atac_target_sum,
-        atac_idf=build_atac_idf([(atac_csr, train_indices)]),
-    )
-
-
-def _normalize_dense_rows(x: np.ndarray, target_sum: float) -> np.ndarray:
-    x = np.asarray(x, dtype=np.float32)
-    if x.ndim == 1:
-        denom = float(x.sum())
-        if denom <= 0.0:
-            denom = 1.0
-        return np.log1p((x / denom) * target_sum)
-
-    denom = x.sum(axis=1, keepdims=True)
-    denom[denom <= 0.0] = 1.0
-    return np.log1p((x / denom) * target_sum)
-
-
-def transform_rna_dense(x: np.ndarray, target_sum: float = 1.0e4) -> np.ndarray:
-    return _normalize_dense_rows(x, target_sum)
-
-
-def transform_atac_dense(x: np.ndarray, atac_idf: np.ndarray, target_sum: float = 1.0e4) -> np.ndarray:
-    x = np.asarray(x, dtype=np.float32)
-    atac_idf = np.asarray(atac_idf, dtype=np.float32)
-
-    if x.ndim == 1:
-        denom = float(x.sum())
-        if denom <= 0.0:
-            denom = 1.0
-        return np.log1p((x / denom) * target_sum * atac_idf)
-
-    denom = x.sum(axis=1, keepdims=True)
-    denom[denom <= 0.0] = 1.0
-    return np.log1p((x / denom) * target_sum * atac_idf[None, :])
-
-
-class PairedSparseDataset(Dataset):
     def __init__(
         self,
-        rna_csr: sp.csr_matrix,
-        atac_csr: sp.csr_matrix,
-        indices: np.ndarray,
-        transforms: PairedTransforms,
-        batch_idx: np.ndarray | None = None,
-        label_idx: np.ndarray | None = None,
-        donor_idx: np.ndarray | None = None,
-        context_idx: np.ndarray | None = None,
+        donor: Sequence[Hashable],
+        context: Sequence[Hashable],
+        config: PopulationBatchConfig,
     ) -> None:
-        self.rna = rna_csr
-        self.atac = atac_csr
-        self.indices = np.asarray(indices, dtype=np.int64)
-        self.transforms = transforms
-        self.batch_idx = None if batch_idx is None else np.asarray(batch_idx, dtype=np.int64)
-        # Optional recorded biological context for within-context association.
-        self.label_idx = None if label_idx is None else np.asarray(label_idx, dtype=np.int64)
-        self.donor_idx = None if donor_idx is None else np.asarray(donor_idx, dtype=np.int64)
-        self.context_idx = None if context_idx is None else np.asarray(context_idx, dtype=np.int64)
-
-    def __len__(self) -> int:
-        return int(self.indices.shape[0])
-
-    def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
-        row = int(self.indices[idx])
-
-        rna = self.rna[row].toarray().ravel().astype(np.float32, copy=False)
-        atac = self.atac[row].toarray().ravel().astype(np.float32, copy=False)
-
-        rna = transform_rna_dense(rna, target_sum=self.transforms.rna_target_sum)
-        if self.transforms.atac_idf is None:
-            raise ValueError("PairedTransforms.atac_idf must be set")
-        atac = transform_atac_dense(atac, self.transforms.atac_idf, target_sum=self.transforms.atac_target_sum)
-
-        out = {
-            "rna": torch.from_numpy(rna),
-            "atac": torch.from_numpy(atac),
-            "row_idx": torch.tensor(row, dtype=torch.long),
+        if len(donor) != len(context) or not donor:
+            raise ValueError("donor and context must be non-empty and row aligned")
+        self.config = config
+        blocks: dict[Hashable, dict[Hashable, list[int]]] = defaultdict(
+            lambda: defaultdict(list)
+        )
+        for index, (donor_value, context_value) in enumerate(zip(donor, context)):
+            blocks[context_value][donor_value].append(index)
+        self._eligible = {
+            context_value: {
+                donor_value: tuple(indices)
+                for donor_value, indices in donor_blocks.items()
+                if len(indices) >= config.cells_per_block
+            }
+            for context_value, donor_blocks in blocks.items()
         }
-        if self.batch_idx is not None:
-            batch_idx = torch.tensor(int(self.batch_idx[idx]), dtype=torch.long)
-            out["rna_batch_idx"] = batch_idx
-            out["atac_batch_idx"] = batch_idx
-        if self.label_idx is not None:
-            out["label_idx"] = torch.tensor(int(self.label_idx[idx]), dtype=torch.long)
-        if self.donor_idx is not None:
-            out["donor_idx"] = torch.tensor(int(self.donor_idx[idx]), dtype=torch.long)
-        if self.context_idx is not None:
-            out["context_idx"] = torch.tensor(int(self.context_idx[idx]), dtype=torch.long)
-        return out
+        self._eligible = {
+            context_value: donor_blocks
+            for context_value, donor_blocks in self._eligible.items()
+            if len(donor_blocks) >= 2
+        }
+        self._contexts = tuple(sorted(self._eligible, key=str))
+        if len(self._contexts) < config.contexts_per_batch:
+            raise ValueError(
+                "insufficient donor-by-context support for production population batches"
+            )
+
+    def epoch(self, epoch: int) -> Iterator[list[int]]:
+        generator = torch.Generator(device="cpu").manual_seed(
+            self.config.seed + 1_000_003 * int(epoch)
+        )
+        for _ in range(self.config.batches_per_epoch):
+            context_order = torch.randperm(
+                len(self._contexts), generator=generator
+            )[: self.config.contexts_per_batch]
+            batch: list[int] = []
+            for context_position in context_order.tolist():
+                context_value = self._contexts[context_position]
+                blocks = self._eligible[context_value]
+                donors = tuple(sorted(blocks, key=str))
+                donor_order = torch.randperm(len(donors), generator=generator)[
+                    : min(self.config.donors_per_context, len(donors))
+                ]
+                for donor_position in donor_order.tolist():
+                    indices = blocks[donors[donor_position]]
+                    chosen = torch.randperm(len(indices), generator=generator)[
+                        : self.config.cells_per_block
+                    ]
+                    batch.extend(indices[position] for position in chosen.tolist())
+            if not batch or len(batch) != len(set(batch)):
+                raise RuntimeError("population sampler produced an invalid batch")
+            yield batch
+
+
+def dense_rows(
+    matrix: sp.csr_matrix,
+    rows: np.ndarray | Sequence[int],
+    device: torch.device,
+) -> torch.Tensor:
+    """Materialize one raw-count batch on the requested device."""
+    return torch.as_tensor(
+        matrix[np.asarray(rows, dtype=np.int64)].toarray(),
+        dtype=torch.float32,
+        device=device,
+    )
