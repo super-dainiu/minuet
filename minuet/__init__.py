@@ -1,15 +1,8 @@
-"""Minuet: compact population-level paired RNA--ATAC representation learning."""
+"""Minuet: paired single-cell RNA and ATAC representations that transfer across donors."""
 
-from .api import Minuet
-from .losses import MinuetLosses
-from .model import MinuetConfig, MinuetEncoder, MinuetModule
+from .model import Minuet
+from .module import MinuetModule
 
-__version__ = "0.3.0"
+__version__ = "1.0.0"
 
-__all__ = [
-    "Minuet",
-    "MinuetModule",
-    "MinuetEncoder",
-    "MinuetConfig",
-    "MinuetLosses",
-]
+__all__ = ["Minuet", "MinuetModule"]
